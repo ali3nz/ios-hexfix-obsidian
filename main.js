@@ -1,4 +1,4 @@
-// iOS Hex Fix 1.1.0: hex polyfill + diagnostics for Self-hosted LiveSync.
+// iOS Hex Fix 1.2.0: hex polyfill + Second Brain LiveSync settings repair.
 if (typeof Uint8Array.fromHex !== "function") {
   Object.defineProperty(Uint8Array, "fromHex", { configurable: true, writable: true, value(s) {
     if (typeof s !== "string" || s.length % 2) throw new SyntaxError("Invalid hex string");
@@ -10,40 +10,50 @@ if (typeof Uint8Array.prototype.toHex !== "function") {
   Object.defineProperty(Uint8Array.prototype, "toHex", { configurable: true, writable: true, value() {
     let r = ""; for (let i = 0; i < this.length; i++) r += this[i].toString(16).padStart(2, "0"); return r; } });
 }
-const { Plugin, Notice } = require("obsidian");
-const errors = [];
-const keep = (k, e) => errors.push(k + ": " + (e && (e.stack || e.message) || String(e)).slice(0, 600));
-window.addEventListener("error", e => keep("error", e.error || e.message));
-window.addEventListener("unhandledrejection", e => keep("rejection", e.reason));
-const wait = ms => new Promise(r => setTimeout(r, ms));
-async function step(name, fn) { try { return name + ": OK " + (await fn() ?? ""); } catch (e) { return name + ": FAIL " + (e && e.message); } }
-async function diagnose(app, plugin) {
-  const out = ["# iOS hexfix diagnostic", new Date().toISOString(), navigator.userAgent, ""];
-  out.push("native fromHex(before polyfill unknown) now: " + typeof Uint8Array.fromHex + ", toHex: " + typeof Uint8Array.prototype.toHex);
-  out.push("fromBase64: " + typeof Uint8Array.fromBase64 + ", toBase64: " + typeof Uint8Array.prototype.toBase64);
-  out.push("crypto.subtle: " + typeof (crypto && crypto.subtle));
-  const ls = app.plugins.plugins["obsidian-livesync"];
-  out.push("livesync loaded: " + !!ls + ", version: " + (ls && ls.manifest && ls.manifest.version));
-  out.push(await step("hex roundtrip", () => Uint8Array.fromHex("00ff10").toHex()));
-  out.push(await step("PBKDF2 310000", async () => { const k = await crypto.subtle.importKey("raw", new TextEncoder().encode("x"), "PBKDF2", false, ["deriveKey"]); await crypto.subtle.deriveKey({ name: "PBKDF2", salt: new Uint8Array(32), iterations: 310000, hash: "SHA-256" }, k, { name: "AES-GCM", length: 256 }, true, ["encrypt"]); }));
-  out.push(await step("HKDF+AES-GCM", async () => { const base = await crypto.subtle.importKey("raw", new Uint8Array(32), "HKDF", false, ["deriveKey"]); const k = await crypto.subtle.deriveKey({ name: "HKDF", salt: new Uint8Array(32), info: new Uint8Array(), hash: "SHA-256" }, base, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]); const iv = new Uint8Array(12); const c = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, k, new Uint8Array([1, 2, 3])); await crypto.subtle.decrypt({ name: "AES-GCM", iv }, k, c); }));
-  out.push("", "## captured errors", ...(errors.length ? errors : ["none"]));
-  try {
-    app.commands.executeCommandById("obsidian-livesync:view-log"); await wait(2500);
-    const el = document.querySelector('.workspace-leaf-content[data-type="log-log"]');
-    let t = el ? el.textContent : "log view not found";
-    t = t.replace(/\/\/[^\/\s:@]+:[^@\s]+@/g, "//REDACTED@").slice(-5000);
-    out.push("", "## livesync log (tail)", t);
-  } catch (e) { out.push("log capture failed: " + e.message); }
-  const path = "hexfix-diagnostic.md";
-  const body = out.join("\n");
+const { Plugin, Notice, requestUrl } = require("obsidian");
+const EXPECTED = "67d932fd28980fad57beedd7848104f0734830aea3dad70b91fec3dd6876d50b";
+const DBNAME = "second-brain";
+const DEFAULT_URI = "https://notes.risingflow.com";
+const sha = async t => [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(t || "")))].map(b => b.toString(16).padStart(2, "0")).join("");
+async function note(app, lines) {
+  const path = "hexfix-diagnostic.md", body = lines.join("\n");
   const f = app.vault.getAbstractFileByPath(path);
   if (f) await app.vault.modify(f, body); else await app.vault.create(path, body);
-  new Notice("Hexfix diagnostic written to hexfix-diagnostic.md");
+}
+async function repair(app, manual) {
+  const out = ["# Second Brain LiveSync repair", new Date().toISOString(), ""];
+  const ls = app.plugins.plugins["obsidian-livesync"];
+  if (!ls || !ls.core) { if (manual) new Notice("Self-hosted LiveSync is not loaded in this vault."); return; }
+  const st = ls.core._services && ls.core._services._setting;
+  const s = st && st.settings;
+  if (!s) { if (manual) new Notice("Could not read LiveSync settings."); return; }
+  if (s.couchDB_DBNAME !== DBNAME) { if (manual) new Notice("This vault is not connected to " + DBNAME + " (it uses '" + s.couchDB_DBNAME + "'). Nothing changed."); return; }
+  const passOk = (await sha(s.passphrase)) === EXPECTED;
+  out.push("passphrase matches server: " + passOk + " (length " + (s.passphrase || "").length + ")");
+  out.push("idDerivationVersion: " + s.idDerivationVersion + ", ID key saved: " + !!s.idDerivationKey);
+  out.push("encrypt: " + s.encrypt + ", E2EE: " + s.E2EEAlgorithm + ", path obfuscation: " + s.usePathObfuscation + ", isConfigured: " + s.isConfigured);
+  const healthy = passOk && !s.idDerivationVersion && !s.idDerivationKey && s.encrypt && s.usePathObfuscation && s.E2EEAlgorithm === "v2" && s.isConfigured;
+  if (healthy) { out.push("", "Settings already correct. Nothing changed."); await note(app, out); if (manual) new Notice("Second Brain settings already correct."); return; }
+  try {
+    const base = (s.couchDB_URI || DEFAULT_URI).replace(/\/+$/, "");
+    const r = await requestUrl({ url: base + "/" + DBNAME + "/_local/phone-setup", headers: { Authorization: "Basic " + btoa(s.couchDB_USER + ":" + s.couchDB_PASSWORD) }, throw: false });
+    if (r.status !== 200) throw new Error("server returned HTTP " + r.status);
+    const pass = r.json.passphrase;
+    if ((await sha(pass)) !== EXPECTED) throw new Error("server passphrase check failed");
+    await st.applyExternalSettings({ passphrase: pass, encrypt: true, E2EEAlgorithm: "v2", usePathObfuscation: true, encryptInternalMetadata: false, idDerivationVersion: 0, idDerivationKey: "", encryptedIdDerivationKey: "", isConfigured: true }, true);
+    const n = st.settings;
+    out.push("", "REPAIRED. Now: passphrase matches: " + ((await sha(n.passphrase)) === EXPECTED) + ", idDerivationVersion: " + n.idDerivationVersion + ", ID key saved: " + !!n.idDerivationKey + ", isConfigured: " + n.isConfigured);
+    await note(app, out);
+    new Notice("Second Brain LiveSync settings repaired. Fully close Obsidian (swipe it away) and reopen it.", 0);
+  } catch (e) {
+    out.push("", "REPAIR FAILED: " + (e && e.message));
+    await note(app, out);
+    new Notice("Second Brain repair failed: " + (e && e.message) + ". See hexfix-diagnostic.md", 0);
+  }
 }
 module.exports = class extends Plugin {
   onload() {
-    this.addCommand({ id: "diagnose", name: "Hexfix: write diagnostic note", callback: () => diagnose(this.app, this) });
-    this.app.workspace.onLayoutReady(() => new Notice("iOS Hex Fix active (hex: " + typeof Uint8Array.fromHex + "/" + typeof Uint8Array.prototype.toHex + ")", 8000));
+    this.addCommand({ id: "repair", name: "Hexfix: repair Second Brain LiveSync settings", callback: () => repair(this.app, true) });
+    this.app.workspace.onLayoutReady(() => setTimeout(() => repair(this.app, false).catch(e => new Notice("Hexfix error: " + e.message, 0)), 4000));
   }
 };
