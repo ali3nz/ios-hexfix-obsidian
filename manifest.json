@@ -1,1 +1,1 @@
-{"id":"ios-hexfix","name":"iOS Hex Fix","version":"1.0.0","minAppVersion":"1.0.0","description":"Polyfills Uint8Array.fromHex/toHex on iOS for Self-hosted LiveSync.","author":"ali3nz","isDesktopOnly":false}
+{"id": "ios-hexfix", "name": "iOS Hex Fix", "version": "1.1.0", "minAppVersion": "1.0.0", "description": "Polyfills Uint8Array.fromHex/toHex on iOS for Self-hosted LiveSync.", "author": "ali3nz", "isDesktopOnly": false}
